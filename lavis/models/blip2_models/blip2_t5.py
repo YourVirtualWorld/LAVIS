@@ -4,7 +4,10 @@
  SPDX-License-Identifier: BSD-3-Clause
  For full license text, see the LICENSE file in the repo root or https://opensource.org/licenses/BSD-3-Clause
 """
+import pdb
 import logging
+
+import jionlp as jio
 
 import torch
 import torch.nn as nn
@@ -61,6 +64,7 @@ class Blip2T5(Blip2Base):
         self.visual_encoder, self.ln_vision = self.init_vision_encoder(
             vit_model, img_size, drop_path_rate, use_grad_checkpoint, vit_precision
         )
+
         if freeze_vit:
             for name, param in self.visual_encoder.named_parameters():
                 param.requires_grad = False
@@ -82,8 +86,7 @@ class Blip2T5(Blip2Base):
         t5_config = T5Config.from_pretrained(t5_model)
         t5_config.dense_act_fn = "gelu"
         self.t5_model = T5ForConditionalGeneration.from_pretrained(
-            t5_model, config=t5_config
-        )
+            t5_model, config=t5_config)
 
         for name, param in self.t5_model.named_parameters():
             param.requires_grad = False
@@ -98,6 +101,8 @@ class Blip2T5(Blip2Base):
 
         self._apply_lemmatizer = apply_lemmatizer
         self._lemmatizer = None
+
+        self.base_tensor_ones = None
 
     def forward(self, samples):
         image = samples["image"]
@@ -119,7 +124,7 @@ class Blip2T5(Blip2Base):
         inputs_t5 = self.t5_proj(query_output.last_hidden_state)
         atts_t5 = torch.ones(inputs_t5.size()[:-1], dtype=torch.long).to(image.device)
 
-        with self.maybe_autocast(dtype=torch.bfloat16):
+        with self.maybe_autocast(dtype=torch.float32):
             input_tokens = self.t5_tokenizer(
                 samples["text_input"],
                 padding="longest",
@@ -127,6 +132,7 @@ class Blip2T5(Blip2Base):
                 max_length=self.max_txt_len,
                 return_tensors="pt",
             ).to(image.device)
+
             output_tokens = self.t5_tokenizer(
                 samples["text_output"],
                 padding="longest",
@@ -185,12 +191,11 @@ class Blip2T5(Blip2Base):
         """
         image = samples["image"]
 
-        with self.maybe_autocast():
+        with self.maybe_autocast(dtype=torch.float32):
             image_embeds = self.ln_vision(self.visual_encoder(image))
-        image_embeds = image_embeds.float()
-        image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(
-            image.device
-        )
+        if image_embeds.dtype != torch.float32:
+            image_embeds = image_embeds.float()
+        image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(image.device)
 
         query_tokens = self.query_tokens.expand(image_embeds.shape[0], -1, -1)
         query_output = self.Qformer.bert(
@@ -221,7 +226,7 @@ class Blip2T5(Blip2Base):
 
         encoder_atts = torch.cat([atts_t5, input_tokens.attention_mask], dim=1)
 
-        with self.maybe_autocast(dtype=torch.bfloat16):
+        with self.maybe_autocast(dtype=torch.float32):
             inputs_embeds = self.t5_model.encoder.embed_tokens(input_tokens.input_ids)
             inputs_embeds = torch.cat([inputs_t5, inputs_embeds], dim=1)
 
@@ -243,6 +248,122 @@ class Blip2T5(Blip2Base):
             )
 
         return output_text
+
+
+    @torch.no_grad()
+    def generate_batch(
+            self,
+            samples,
+            use_nucleus_sampling=False,
+            num_beams=5,
+            max_length=30,
+            min_length=1,
+            top_p=0.9,
+            repetition_penalty=1.0,
+            length_penalty=1.0,
+            num_captions=1,
+            temperature=1,
+    ):
+        """
+        Args:
+            samples (dict): A dictionary containing the following keys:
+                - image (torch.Tensor): A tensor of shape (batch_size, 3, H, W)
+            use_nucleus_sampling (bool): Whether to use nucleus sampling. If False, use top-k sampling.
+            num_beams (int): Number of beams for beam search. 1 means no beam search.
+            max_length (int): The maximum length of the sequence to be generated.
+            min_length (int): The minimum length of the sequence to be generated.
+            top_p (float): The cumulative probability for nucleus sampling.
+            repetition_penalty (float): The parameter for repetition penalty. 1.0 means no penalty.
+            num_captions (int): Number of captions to be generated for each image.
+        Returns:
+            captions (list): A list of strings of length batch_size * num_captions.
+        """
+
+        # get batch image
+        image = samples["image"]
+
+        # get batch prompt
+        if "prompt" in samples.keys():
+            prompt = samples["prompt"]
+        else:
+            prompt = self.prompt
+
+        if isinstance(prompt, str):
+            prompt = [prompt] * image.size(0)
+        else:
+            assert len(prompt) == image.size(
+                0), "The number of prompts must be equal to the batch size."
+
+
+        with self.maybe_autocast(dtype=torch.float32):
+            image_embeds = self.ln_vision(self.visual_encoder(image))
+
+        if image_embeds.dtype != torch.float32:
+            image_embeds = image_embeds.float()
+        with jio.TimeIt("float converter"):
+            if self.base_tensor_ones is None:
+                self.base_tensor_ones = torch.ones(
+                    [64, 10000], dtype=torch.long).to(image.device)
+
+            # image_atts = torch.ones(image_embeds.size()[:-1],
+            #                         dtype=torch.long).to(image.device)
+            image_embeds_size = image_embeds.size()[:-1]
+            image_atts = self.base_tensor_ones[:image_embeds_size[0], :image_embeds_size[1]]
+
+            query_tokens = self.query_tokens.expand(image_embeds.shape[0], -1, -1)
+
+        with jio.TimeIt("q bert"):
+            query_output = self.Qformer.bert(
+                query_embeds=query_tokens,
+                encoder_hidden_states=image_embeds,
+                encoder_attention_mask=image_atts,
+                return_dict=True)
+
+        inputs_t5 = self.t5_proj(query_output.last_hidden_state)
+
+        with jio.TimeIt("input_t5"):
+            # atts_t5 = torch.ones(inputs_t5.size()[:-1],
+            #                      dtype=torch.long).to(image.device)
+            inputs_t5_size = inputs_t5.size()[:-1]
+            atts_t5 = self.base_tensor_ones[:inputs_t5_size[0], :inputs_t5_size[1]]
+
+        # encode text query
+        with jio.TimeIt("t5_tokenizer"):
+            input_tokens = self.t5_tokenizer(
+                prompt,
+                padding="longest",
+                return_tensors="pt")
+
+        with jio.TimeIt("to cuda compute"):
+            input_tokens = input_tokens.to(image.device)
+        # pdb.set_trace()
+
+        encoder_atts = torch.cat([atts_t5, input_tokens.attention_mask], dim=1)
+
+        with self.maybe_autocast(dtype=torch.float32):
+            inputs_embeds = self.t5_model.encoder.embed_tokens(
+                input_tokens.input_ids)
+            inputs_embeds = torch.cat([inputs_t5, inputs_embeds], dim=1)
+
+            with jio.TimeIt("text decoder") as ti:
+                outputs = self.t5_model.generate(
+                    inputs_embeds=inputs_embeds,
+                    attention_mask=encoder_atts,
+                    do_sample=use_nucleus_sampling,
+                    top_p=top_p,
+                    temperature=temperature,
+                    num_beams=num_beams,
+                    max_new_tokens=max_length,
+                    min_length=min_length,
+                    repetition_penalty=repetition_penalty,
+                    length_penalty=length_penalty,
+                    num_return_sequences=num_captions)
+
+            output_text = self.t5_tokenizer.batch_decode(
+                outputs, skip_special_tokens=True)
+
+        return output_text
+
 
     def predict_answers(
         self,
@@ -289,7 +410,7 @@ class Blip2T5(Blip2Base):
 
         encoder_atts = torch.cat([atts_t5, input_tokens.attention_mask], dim=1)
 
-        with self.maybe_autocast(dtype=torch.bfloat16):
+        with self.maybe_autocast(dtype=torch.float32):
             inputs_embeds = self.t5_model.encoder.embed_tokens(input_tokens.input_ids)
             inputs_embeds = torch.cat([inputs_t5, inputs_embeds], dim=1)
 
